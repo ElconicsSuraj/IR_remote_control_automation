@@ -1,14 +1,27 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <IRremote.h>
+#include <time.h>
+#include <ArduinoJson.h>
 
 #define IR_LED_PIN 4
 
 // ================= WIFI =================
-const char* ssid = "Elconics";
-const char* password = "Elconics@123";
+const char* ssid = "Antz_IoT";
+const char* password = "AntzIoT@123";
 
 WebServer server(80);
+
+// ================= SCHEDULER DATA =================
+uint8_t schedule[7][24]; // 7 days (0=Sun, 6=Sat), 24 hours
+int lastFiredHour = -1;
+int lastFiredDay = -1;
+bool forceCheck = false; // Flag to trigger immediate schedule check
+
+// ================= NTP CONFIG =================
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 19800; // +5:30 (19800 seconds)
+const int daylightOffset_sec = 0;
 
 // ================= IR RAW DATA =================
 // KEEP YOUR EXISTING RAW ARRAYS HERE
@@ -45,118 +58,216 @@ uint16_t temp30[] = { 1050, 550, 1050, 550, 1050, 2500, 1050, 2500, 1100, 500, 1
 
 // ================= HTML PAGE =================
 String webpage = R"rawliteral(
-
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-
-<meta name="viewport" content="width=device-width, initial-scale=1">
-
-<style>
-
-body{
-    font-family: Arial;
-    background:#111;
-    color:white;
-    text-align:center;
-    margin-top:30px;
-}
-
-button{
-    width:90px;
-    height:50px;
-    margin:8px;
-    border:none;
-    border-radius:10px;
-    font-size:18px;
-    font-weight:bold;
-    cursor:pointer;
-}
-
-.on{
-    background:#00c853;
-    color:white;
-}
-
-.off{
-    background:#d50000;
-    color:white;
-}
-
-.temp{
-    background:#2962ff;
-    color:white;
-}
-
-h1{
-    margin-bottom:30px;
-}
-
-</style>
-
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart AC Controller</title>
+    <style>
+        :root {
+            --primary: #00f2fe;
+            --secondary: #4facfe;
+            --bg: #0f172a;
+            --card: #1e293b;
+            --text: #f8fafc;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .container {
+            width: 95%;
+            max-width: 1200px;
+            padding: 20px;
+        }
+        .card {
+            background: var(--card);
+            border-radius: 15px;
+            padding: 20px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+            margin-bottom: 20px;
+        }
+        h1 { text-align: center; background: linear-gradient(to right, var(--primary), var(--secondary)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .tabs { display: flex; justify-content: center; margin-bottom: 20px; gap: 10px; }
+        .tab { padding: 10px 20px; cursor: pointer; border-radius: 8px; background: #334155; transition: 0.3s; }
+        .tab.active { background: var(--secondary); color: white; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        
+        /* Remote UI */
+        .btn-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)); gap: 10px; }
+        button { padding: 15px; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        button:active { transform: scale(0.95); }
+        .btn-on { background: #22c55e; color: white; }
+        .btn-off { background: #ef4444; color: white; }
+        .btn-temp { background: #3b82f6; color: white; }
+        
+        /* Scheduler UI */
+        .sched-controls { display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 15px; align-items: center; background: #334155; padding: 15px; border-radius: 10px; }
+        .sched-grid-container { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; min-width: 800px; }
+        th, td { border: 1px solid #475569; text-align: center; padding: 5px; font-size: 12px; }
+        .cell { width: 30px; height: 30px; cursor: pointer; transition: 0.2s; }
+        .cell:hover { background: #475569; }
+        .day-label { font-weight: bold; width: 50px; }
+        
+        .status-bar { position: fixed; bottom: 20px; right: 20px; padding: 10px 20px; border-radius: 20px; background: var(--secondary); display: none; }
+    </style>
 </head>
-
 <body>
+    <div class="container">
+        <h1>Lloyd AC Smart Hub</h1>
+        
+        <div class="tabs">
+            <div class="tab active" onclick="showTab('remote')">Remote</div>
+            <div class="tab" onclick="showTab('scheduler')">Scheduler</div>
+        </div>
 
-<h1>Havells Lloyd AC Controller</h1>
+        <!-- Remote Tab -->
+        <div id="remote" class="tab-content active">
+            <div class="card">
+                <h3>Power</h3>
+                <div class="btn-grid">
+                    <button class="btn-on" onclick="cmd('/on')">ON</button>
+                    <button class="btn-off" onclick="cmd('/off')">OFF</button>
+                </div>
+            </div>
+            <div class="card">
+                <h3>Temperature</h3>
+                <div class="btn-grid" id="temp-btns"></div>
+            </div>
+        </div>
 
-<button class="on" onclick="sendCmd('/on')">
-ON
-</button>
+        <!-- Scheduler Tab -->
+        <div id="scheduler" class="tab-content">
+            <div class="card">
+                <div class="sched-controls">
+                    <div>
+                        Temp: <select id="sel-temp">
+                            <option value="0">No Action</option>
+                            <option value="1">OFF</option>
+                            <option value="16">16°C</option><option value="17">17°C</option><option value="18">18°C</option>
+                            <option value="19">19°C</option><option value="20">20°C</option><option value="21">21°C</option>
+                            <option value="22">22°C</option><option value="23">23°C</option><option value="24">24°C</option>
+                            <option value="25">25°C</option><option value="26">26°C</option><option value="27">27°C</option>
+                            <option value="28">28°C</option><option value="29">29°C</option><option value="30">30°C</option>
+                        </select>
+                    </div>
+                    <div>
+                        Slot: <select id="sel-slot">
+                            <option value="1">1 Hour</option>
+                            <option value="4">4 Hours</option>
+                            <option value="6">6 Hours</option>
+                            <option value="12">12 Hours</option>
+                            <option value="24">24 Hours (Full Day)</option>
+                        </select>
+                    </div>
+                    <button class="btn-temp" onclick="saveSchedule()">Save Schedule</button>
+                    <button style="background:#64748b" onclick="loadSchedule()">Reload</button>
+                </div>
+                
+                <div class="sched-grid-container">
+                    <table id="sched-table">
+                        <thead>
+                            <tr><th>Day</th><script>for(let i=0;i<24;i++) document.write(`<th>${i}h</th>`);</script></tr>
+                        </thead>
+                        <tbody id="sched-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
 
-<button class="off" onclick="sendCmd('/off')">
-OFF
-</button>
+    <div id="status" class="status-bar"></div>
 
-<br><br>
+    <script>
+        const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        let schedule = Array(7).fill().map(() => Array(24).fill(0));
+        let deviceId = "";
 
-<div>
+        // Build Temp Buttons
+        const tGrid = document.getElementById('temp-btns');
+        for(let i=16; i<=30; i++) {
+            tGrid.innerHTML += `<button class="btn-temp" onclick="cmd('/temp?value=${i}')">${i}°</button>`;
+        }
 
-<button class="temp" onclick="sendCmd('/temp?value=16')">16</button>
-<button class="temp" onclick="sendCmd('/temp?value=17')">17</button>
-<button class="temp" onclick="sendCmd('/temp?value=18')">18</button>
-<button class="temp" onclick="sendCmd('/temp?value=19')">19</button>
-<button class="temp" onclick="sendCmd('/temp?value=20')">20</button>
+        // Build Grid
+        const sBody = document.getElementById('sched-body');
+        days.forEach((day, dIdx) => {
+            let row = `<tr><td class="day-label">${day}</td>`;
+            for(let h=0; h<24; h++) {
+                row += `<td class="cell" id="c-${dIdx}-${h}" onclick="fillSlot(${dIdx}, ${h})">--</td>`;
+            }
+            row += `</tr>`;
+            sBody.innerHTML += row;
+        });
 
-<br>
+        function showTab(id) {
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.getElementById(id).classList.add('active');
+            event.currentTarget.classList.add('active');
+            if(id === 'scheduler') loadSchedule();
+        }
 
-<button class="temp" onclick="sendCmd('/temp?value=21')">21</button>
-<button class="temp" onclick="sendCmd('/temp?value=22')">22</button>
-<button class="temp" onclick="sendCmd('/temp?value=23')">23</button>
-<button class="temp" onclick="sendCmd('/temp?value=24')">24</button>
-<button class="temp" onclick="sendCmd('/temp?value=25')">25</button>
+        function cmd(url) {
+            notify("Sending Command...");
+            fetch(url).then(r => r.text()).then(t => notify(t));
+        }
 
-<br>
+        function notify(msg) {
+            const s = document.getElementById('status');
+            s.innerText = msg; s.style.display = 'block';
+            setTimeout(() => s.style.display = 'none', 3000);
+        }
 
-<button class="temp" onclick="sendCmd('/temp?value=26')">26</button>
-<button class="temp" onclick="sendCmd('/temp?value=27')">27</button>
-<button class="temp" onclick="sendCmd('/temp?value=28')">28</button>
-<button class="temp" onclick="sendCmd('/temp?value=29')">29</button>
-<button class="temp" onclick="sendCmd('/temp?value=30')">30</button>
+        function fillSlot(d, h) {
+            const temp = parseInt(document.getElementById('sel-temp').value);
+            const slot = parseInt(document.getElementById('sel-slot').value);
+            for(let i=0; i<slot; i++) {
+                let currentH = (h + i) % 24;
+                let currentD = d + Math.floor((h + i) / 24);
+                if(currentD < 7) {
+                    schedule[currentD][currentH] = temp;
+                    updateCellUI(currentD, currentH);
+                }
+            }
+        }
 
-</div>
+        function updateCellUI(d, h) {
+            const cell = document.getElementById(`c-${d}-${h}`);
+            const val = schedule[d][h];
+            cell.innerText = val === 0 ? '--' : (val === 1 ? 'OFF' : val + '°');
+            cell.style.background = val > 1 ? `rgba(59, 130, 246, ${0.2 + (val-16)/20})` : (val === 1 ? 'rgba(239, 68, 68, 0.3)' : 'transparent');
+        }
 
-<br><br>
+        function loadSchedule() {
+            fetch('/schedule').then(r => r.json()).then(data => {
+                schedule = data.schedule;
+                deviceId = data.device_id;
+                for(let d=0; d<7; d++) for(let h=0; h<24; h++) updateCellUI(d, h);
+                notify("Schedule Loaded");
+            });
+        }
 
-<h2 id="status">Ready</h2>
-
-<script>
-
-function sendCmd(url){
-
-    fetch(url)
-    .then(response => response.text())
-    .then(data => {
-        document.getElementById("status").innerHTML = data;
-    });
-
-}
-
-</script>
-
+        function saveSchedule() {
+            notify("Saving...");
+            fetch('/schedule', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ device_id: deviceId, schedule: schedule })
+            }).then(r => r.text()).then(t => notify(t));
+        }
+    </script>
 </body>
 </html>
-
 )rawliteral";
 
 // ================= SEND FUNCTIONS =================
@@ -267,6 +378,21 @@ void setup() {
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
 
+  // NTP Sync
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("Waiting for NTP sync...");
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    Serial.println("Time synced successfully");
+  }
+
+  // Initialize schedule with 0 (No Action)
+  for(int i=0; i<7; i++) {
+    for(int j=0; j<24; j++) {
+      schedule[i][j] = 0;
+    }
+  }
+
   // ================= WEB ROUTES =================
 
   server.on("/", []() {
@@ -319,6 +445,60 @@ void setup() {
 
   });
 
+  server.on("/schedule", HTTP_GET, []() {
+    StaticJsonDocument<4096> doc;
+    doc["device_id"] = WiFi.macAddress();
+    JsonArray schedArr = doc.createNestedArray("schedule");
+    for (int i = 0; i < 7; i++) {
+      JsonArray dayArr = schedArr.createNestedArray();
+      for (int j = 0; j < 24; j++) {
+        dayArr.add(schedule[i][j]);
+      }
+    }
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+  });
+
+  server.on("/schedule", HTTP_POST, []() {
+    if (server.hasArg("plain") == false) {
+      server.send(400, "text/plain", "Body not found");
+      return;
+    }
+
+    StaticJsonDocument<4096> doc;
+    DeserializationError error = deserializeJson(doc, server.arg("plain"));
+
+    if (error) {
+      server.send(400, "text/plain", "JSON parse failed");
+      return;
+    }
+
+    // Check device ID
+    String receivedId = doc["device_id"];
+    if (receivedId != WiFi.macAddress()) {
+      server.send(403, "text/plain", "Unauthorized: Device ID mismatch");
+      return;
+    }
+
+    JsonArray schedArr = doc["schedule"];
+    if (schedArr.size() == 7) {
+      for (int i = 0; i < 7; i++) {
+        JsonArray dayArr = schedArr[i];
+        if (dayArr.size() == 24) {
+          for (int j = 0; j < 24; j++) {
+            schedule[i][j] = dayArr[j];
+          }
+        }
+      }
+      forceCheck = true; // Trigger immediate check
+      lastFiredHour = -1; // Force re-trigger even if same hour
+      server.send(200, "text/plain", "Schedule Updated");
+    } else {
+      server.send(400, "text/plain", "Invalid schedule format");
+    }
+  });
+
   server.begin();
 
   Serial.println("Web Server Started");
@@ -327,7 +507,35 @@ void setup() {
 // ================= LOOP =================
 
 void loop() {
-
   server.handleClient();
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 60000 || lastCheck == 0 || forceCheck) {
+    lastCheck = millis();
+    forceCheck = false;
+    
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      int currentHour = timeinfo.tm_hour;
+      int currentDay = timeinfo.tm_wday; // 0=Sun, 6=Sat
 
+      Serial.printf("Current Time: %02d:%02d (Day: %d)\n", currentHour, timeinfo.tm_min, currentDay);
+
+      if (currentHour != lastFiredHour || currentDay != lastFiredDay) {
+        uint8_t targetTemp = schedule[currentDay][currentHour];
+        Serial.printf("Schedule Check: Day %d, Hour %d -> Target %d\n", currentDay, currentHour, targetTemp);
+        
+        if (targetTemp >= 16 && targetTemp <= 30) {
+          Serial.printf("Scheduled Event: Setting temp to %d\n", targetTemp);
+          sendTemperature(targetTemp);
+        } else if (targetTemp == 1) { // 1 for Power OFF
+           Serial.println("Scheduled Event: AC OFF");
+           sendPowerOff();
+        }
+        lastFiredHour = currentHour;
+        lastFiredDay = currentDay;
+      }
+    } else {
+      Serial.println("Failed to obtain time (NTP not synced?)");
+    }
+  }
 }
