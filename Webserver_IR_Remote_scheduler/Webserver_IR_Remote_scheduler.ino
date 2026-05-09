@@ -3,8 +3,11 @@
 #include <IRremote.h>
 #include <time.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 
 #define IR_LED_PIN 4
+
+Preferences preferences;
 
 // ================= WIFI =================
 const char* ssid = "Antz_IoT";
@@ -270,6 +273,32 @@ String webpage = R"rawliteral(
 </html>
 )rawliteral";
 
+// ================= NVS STORAGE =================
+
+void saveScheduleToNVS() {
+  preferences.begin("ac-sched", false);
+  preferences.putBytes("schedule", schedule, sizeof(schedule));
+  preferences.end();
+  Serial.println("Schedule saved to NVS");
+}
+
+void loadScheduleFromNVS() {
+  preferences.begin("ac-sched", true);
+  size_t schLen = preferences.getBytesLength("schedule");
+  if (schLen == sizeof(schedule)) {
+    preferences.getBytes("schedule", schedule, sizeof(schedule));
+    Serial.println("Schedule loaded from NVS");
+  } else {
+    Serial.println("No valid schedule found in NVS, initializing with 0");
+    for (int i = 0; i < 7; i++) {
+      for (int j = 0; j < 24; j++) {
+        schedule[i][j] = 0;
+      }
+    }
+  }
+  preferences.end();
+}
+
 // ================= SEND FUNCTIONS =================
 
 void sendPowerOn() {
@@ -386,12 +415,8 @@ void setup() {
     Serial.println("Time synced successfully");
   }
 
-  // Initialize schedule with 0 (No Action)
-  for(int i=0; i<7; i++) {
-    for(int j=0; j<24; j++) {
-      schedule[i][j] = 0;
-    }
-  }
+  // Load schedule from NVS (replaces manual initialization)
+  loadScheduleFromNVS();
 
   // ================= WEB ROUTES =================
 
@@ -491,6 +516,7 @@ void setup() {
           }
         }
       }
+      saveScheduleToNVS(); // Save to NVS after successful update
       forceCheck = true; // Trigger immediate check
       lastFiredHour = -1; // Force re-trigger even if same hour
       server.send(200, "text/plain", "Schedule Updated");
