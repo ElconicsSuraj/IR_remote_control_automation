@@ -4,14 +4,26 @@
 #include <time.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <Wire.h>
+#include <RTClib.h>
 
 #define IR_LED_PIN 4
+#define BUZZER_PIN 5
 
 Preferences preferences;
+RTC_DS3231 rtc;
+bool isAPMode = false;
+
+// Non-blocking buzzer state
+unsigned long buzzerStartTime = 0;
+unsigned long buzzerDuration = 0;
+int buzzerPatternCount = 0;
+unsigned long nextBeepTime = 0;
+bool buzzerActive = false;
 
 // ================= WIFI =================
-const char* ssid = "Antz_IoT";
-const char* password = "AntzIoT@123";
+const char* ssid = "Elconics";
+const char* password = "Elconics@123";
 
 WebServer server(80);
 
@@ -20,6 +32,8 @@ uint8_t schedule[7][24]; // 7 days (0=Sun, 6=Sat), 24 hours
 int lastFiredHour = -1;
 int lastFiredDay = -1;
 bool forceCheck = false; // Flag to trigger immediate schedule check
+int activeTemp = 0;    // Currently set temperature
+bool acPower = false;  // Current power state
 
 // ================= NTP CONFIG =================
 const char* ntpServer = "pool.ntp.org";
@@ -110,7 +124,11 @@ String webpage = R"rawliteral(
         button:active { transform: scale(0.95); }
         .btn-on { background: #22c55e; color: white; }
         .btn-off { background: #ef4444; color: white; }
-        .btn-temp { background: #3b82f6; color: white; }
+        .btn-temp { background: #3b82f6; color: white; border: 2px solid transparent; }
+        .btn-temp.active { border-color: var(--primary); box-shadow: 0 0 15px var(--primary); transform: scale(1.05); }
+        .cell.current-slot { border: 2px solid #fbbf24 !important; background: rgba(251, 191, 36, 0.4) !important; box-shadow: inset 0 0 10px #fbbf24; z-index: 10; position: relative; }
+        .active-status { background: #334155; padding: 10px; border-radius: 10px; margin-bottom: 15px; display: flex; justify-content: space-around; font-weight: bold; }
+        .status-val { color: var(--primary); }
         
         /* Scheduler UI */
         .sched-controls { display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 15px; align-items: center; background: #334155; padding: 15px; border-radius: 10px; }
@@ -141,6 +159,11 @@ String webpage = R"rawliteral(
                     <button class="btn-on" onclick="cmd('/on')">ON</button>
                     <button class="btn-off" onclick="cmd('/off')">OFF</button>
                 </div>
+            </div>
+            <div class="active-status">
+                <div>Time: <span id="stat-time" class="status-val">--:--</span></div>
+                <div>Power: <span id="stat-power" class="status-val">OFF</span></div>
+                <div>Setting: <span id="stat-temp" class="status-val">--</span></div>
             </div>
             <div class="card">
                 <h3>Temperature</h3>
@@ -198,7 +221,7 @@ String webpage = R"rawliteral(
         // Build Temp Buttons
         const tGrid = document.getElementById('temp-btns');
         for(let i=16; i<=30; i++) {
-            tGrid.innerHTML += `<button class="btn-temp" onclick="cmd('/temp?value=${i}')">${i}°</button>`;
+            tGrid.innerHTML += `<button class="btn-temp" id="tbtn-${i}" onclick="cmd('/temp?value=${i}')">${i}°</button>`;
         }
 
         // Build Grid
@@ -222,7 +245,10 @@ String webpage = R"rawliteral(
 
         function cmd(url) {
             notify("Sending Command...");
-            fetch(url).then(r => r.text()).then(t => notify(t));
+            fetch(url).then(r => r.text()).then(t => {
+                notify(t);
+                setTimeout(loadSchedule, 500); // Refresh UI after command
+            });
         }
 
         function notify(msg) {
@@ -255,10 +281,31 @@ String webpage = R"rawliteral(
             fetch('/schedule').then(r => r.json()).then(data => {
                 schedule = data.schedule;
                 deviceId = data.device_id;
+                
+                // Update Status UI
+                document.getElementById('stat-power').innerText = data.power ? "ON" : "OFF";
+                document.getElementById('stat-temp').innerText = data.temp > 1 ? data.temp + "°C" : (data.temp === 1 ? "OFF" : "--");
+                document.getElementById('stat-time').innerText = `${String(data.hour).padStart(2,'0')}:${String(data.min).padStart(2,'0')}`;
+                
+                // Highlight active button
+                document.querySelectorAll('.btn-temp').forEach(b => b.classList.remove('active'));
+                if(data.temp >= 16) {
+                    const activeBtn = document.getElementById(`tbtn-${data.temp}`);
+                    if(activeBtn) activeBtn.classList.add('active');
+                }
+
+                // Highlight current time slot in yellow
+                document.querySelectorAll('.cell').forEach(c => c.classList.remove('current-slot'));
+                const currentCell = document.getElementById(`c-${data.day}-${data.hour}`);
+                if(currentCell) currentCell.classList.add('current-slot');
+
                 for(let d=0; d<7; d++) for(let h=0; h<24; h++) updateCellUI(d, h);
-                notify("Schedule Loaded");
+                notify("UI Synced");
             });
         }
+
+        // Auto-refresh every 30 seconds to sync scheduler events
+        setInterval(loadSchedule, 30000);
 
         function saveSchedule() {
             notify("Saving...");
@@ -299,22 +346,64 @@ void loadScheduleFromNVS() {
   preferences.end();
 }
 
-// ================= SEND FUNCTIONS =================
+// ================= NON-BLOCKING BUZZER =================
+void startBeep(unsigned long duration, int pattern = 1) {
+  buzzerDuration = duration;
+  buzzerPatternCount = pattern;
+  buzzerStartTime = millis();
+  nextBeepTime = millis();
+  buzzerActive = true;
+}
 
+void updateBuzzer() {
+  if (!buzzerActive) return;
+
+  unsigned long now = millis();
+  if (now >= nextBeepTime) {
+    if (digitalRead(BUZZER_PIN) == LOW) {
+      // Start a beep
+      digitalWrite(BUZZER_PIN, HIGH);
+      nextBeepTime = now + buzzerDuration;
+    } else {
+      // End a beep
+      digitalWrite(BUZZER_PIN, LOW);
+      buzzerPatternCount--;
+      if (buzzerPatternCount <= 0) {
+        buzzerActive = false;
+      } else {
+        nextBeepTime = now + buzzerDuration; // Gap between beeps
+      }
+    }
+  }
+}
+
+void beepShort() { startBeep(100, 1); }
+void beepSave() { startBeep(80, 2); }
+void beepAP() { startBeep(50, 3); }
+void beepWiFiConnected() { startBeep(100, 2); }
+
+// ================= IR SEND FUNCTIONS =================
 void sendPowerOn() {
-  Serial.println("POWER ON");
+  beepShort();
+  Serial.println("Sending Power ON");
+  acPower = true;
   IrSender.sendRaw(powerOn, sizeof(powerOn) / sizeof(powerOn[0]), 38);
 }
 
 void sendPowerOff() {
-  Serial.println("POWER OFF");
+  beepShort();
+  Serial.println("Sending Power OFF");
+  acPower = false;
+  activeTemp = 1; // 1 represents OFF state
   IrSender.sendRaw(powerOff, sizeof(powerOff) / sizeof(powerOff[0]), 38);
 }
 
 void sendTemperature(int temp) {
-
+  beepShort();
   Serial.print("Sending Temp: ");
   Serial.println(temp);
+  activeTemp = temp;
+  acPower = true;
 
   switch(temp) {
 
@@ -387,32 +476,54 @@ void setup() {
   Serial.begin(115200);
 
   IrSender.begin(IR_LED_PIN);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
 
-  // WIFI CONNECT
-  WiFi.begin(ssid, password);
-
-  Serial.println();
-  Serial.print("Connecting");
-
-  while (WiFi.status() != WL_CONNECTED) {
-
-    delay(500);
-    Serial.print(".");
-
+  // RTC Init
+  if (!rtc.begin()) {
+    Serial.println("Couldn't find RTC");
   }
 
+  // WIFI CONNECT with stability fixes
+  WiFi.disconnect(true); // Clear previous settings
+  delay(100);
+  WiFi.mode(WIFI_STA);   // Explicitly set Station mode
+  WiFi.setSleep(false);  // Disable power saving for better stability
+  
+  WiFi.begin(ssid, password);
   Serial.println();
-  Serial.println("WiFi Connected");
+  Serial.print("Connecting to WiFi");
+  
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
 
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    beepWiFiConnected(); // Double beep for Online
 
-  // NTP Sync
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  Serial.println("Waiting for NTP sync...");
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    Serial.println("Time synced successfully");
+    // NTP Sync
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    Serial.println("Waiting for NTP sync...");
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      Serial.println("Time synced from NTP");
+      // Update RTC with NTP time
+      rtc.adjust(DateTime(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, 
+                          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec));
+      Serial.println("RTC updated from NTP");
+    }
+  } else {
+    Serial.println("\nWiFi failed. Starting Access Point Mode...");
+    WiFi.softAP("Smart-AC-Hub", "12345678");
+    isAPMode = true;
+    beepAP(); // Triple beep for AP Mode
+    Serial.print("AP IP Address: ");
+    Serial.println(WiFi.softAPIP());
   }
 
   // Load schedule from NVS (replaces manual initialization)
@@ -427,52 +538,56 @@ void setup() {
   });
 
   server.on("/on", []() {
-
-    sendPowerOn();
-
     server.send(200, "text/plain", "AC POWER ON");
-
+    sendPowerOn();
   });
 
   server.on("/off", []() {
-
-    sendPowerOff();
-
     server.send(200, "text/plain", "AC POWER OFF");
-
+    sendPowerOff();
   });
 
   server.on("/temp", []() {
-
     if(server.hasArg("value")) {
-
       int temp = server.arg("value").toInt();
-
       if(temp >= 16 && temp <= 30) {
-
+        server.send(200, "text/plain", "Temperature Set To " + String(temp) + " C");
         sendTemperature(temp);
-
-        server.send(200, "text/plain",
-                    "Temperature Set To " + String(temp) + " C");
-
       }
       else {
-
         server.send(400, "text/plain", "Invalid Temperature");
-
       }
-
     } else {
-
       server.send(400, "text/plain", "Temperature Missing");
-
     }
-
   });
 
   server.on("/schedule", HTTP_GET, []() {
     StaticJsonDocument<4096> doc;
     doc["device_id"] = WiFi.macAddress();
+    doc["temp"] = activeTemp;
+    doc["power"] = acPower;
+    
+    struct tm timeinfo;
+    bool timeValid = false;
+    if (getLocalTime(&timeinfo)) {
+      timeValid = true;
+    } else {
+      DateTime now = rtc.now();
+      timeinfo.tm_hour = now.hour();
+      timeinfo.tm_min = now.minute();
+      timeinfo.tm_wday = now.dayOfTheWeek();
+      timeValid = true;
+    }
+
+    if (timeValid) {
+      doc["hour"] = timeinfo.tm_hour;
+      doc["min"] = timeinfo.tm_min;
+      doc["day"] = timeinfo.tm_wday;
+    } else {
+      doc["hour"] = 0; doc["min"] = 0; doc["day"] = 0;
+    }
+
     JsonArray schedArr = doc.createNestedArray("schedule");
     for (int i = 0; i < 7; i++) {
       JsonArray dayArr = schedArr.createNestedArray();
@@ -517,8 +632,8 @@ void setup() {
         }
       }
       saveScheduleToNVS(); // Save to NVS after successful update
+      beepSave(); // Buzzer feedback for save
       forceCheck = true; // Trigger immediate check
-      lastFiredHour = -1; // Force re-trigger even if same hour
       server.send(200, "text/plain", "Schedule Updated");
     } else {
       server.send(400, "text/plain", "Invalid schedule format");
@@ -534,19 +649,39 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  updateBuzzer();
+  
   static unsigned long lastCheck = 0;
-  if (millis() - lastCheck > 60000 || lastCheck == 0 || forceCheck) {
+  if (millis() - lastCheck > 10000 || lastCheck == 0 || forceCheck) {
     lastCheck = millis();
-    forceCheck = false;
-    
+    // Use the forceCheck flag to re-trigger if needed
+    bool savedForceCheck = forceCheck;
+    forceCheck = false; 
     struct tm timeinfo;
+    bool hasTime = false;
+    
     if (getLocalTime(&timeinfo)) {
+      hasTime = true;
+    } else {
+      // Fallback to RTC
+      DateTime now = rtc.now();
+      timeinfo.tm_hour = now.hour();
+      timeinfo.tm_min = now.minute();
+      timeinfo.tm_wday = now.dayOfTheWeek();
+      timeinfo.tm_sec = now.second();
+      hasTime = true;
+      Serial.println("Using RTC time (Offline)");
+    }
+
+    if (hasTime) {
       int currentHour = timeinfo.tm_hour;
       int currentDay = timeinfo.tm_wday; // 0=Sun, 6=Sat
 
-      Serial.printf("Current Time: %02d:%02d (Day: %d)\n", currentHour, timeinfo.tm_min, currentDay);
-
-      if (currentHour != lastFiredHour || currentDay != lastFiredDay) {
+      if (currentHour != lastFiredHour || currentDay != lastFiredDay || savedForceCheck) {
+        Serial.printf("Applying Schedule: %02d:00 (Day: %d) [%s]\n", 
+                      currentHour, currentDay, 
+                      WiFi.status() == WL_CONNECTED ? "Online" : "Offline");
+        
         uint8_t targetTemp = schedule[currentDay][currentHour];
         Serial.printf("Schedule Check: Day %d, Hour %d -> Target %d\n", currentDay, currentHour, targetTemp);
         
@@ -561,7 +696,7 @@ void loop() {
         lastFiredDay = currentDay;
       }
     } else {
-      Serial.println("Failed to obtain time (NTP not synced?)");
+      Serial.println("Failed to obtain time (NTP and RTC failed?)");
     }
   }
 }
