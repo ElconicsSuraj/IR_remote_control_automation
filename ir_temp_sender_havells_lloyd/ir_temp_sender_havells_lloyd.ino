@@ -1,6 +1,6 @@
 #include <IRremote.h>
 
-#define IR_LED_PIN 4   // connect IR LED (via transistor)
+#define IR_LED_PIN 13   // connect IR LED (via transistor)
 
 // ====== POWER ON ======
 uint16_t powerOn[] = {
